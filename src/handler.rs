@@ -1,79 +1,65 @@
-use crate::{ws, Client, Clients, Result};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use std::time::Duration;
+use log::{debug, error};
+use crate::{ws, Clients, WSResult as Result, RedisCache, Cache};
 use uuid::Uuid;
-use warp::{http::StatusCode, reply::json, ws::Message, Reply};
+use warp::{http::StatusCode, ws::Message, Reply};
+use warp::reply::with_status;
+use crate::ws_response::WSCallResourceRequest;
 
-#[derive(Deserialize, Debug)]
-pub struct RegisterRequest {
-    user_id: usize,
-}
 
-#[derive(Serialize, Debug)]
-pub struct RegisterResponse {
-    url: String,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct Event {
-    topic: String,
-    user_id: Option<usize>,
-    message: String,
-}
-
-pub async fn publish_handler(body: Event, clients: Clients) -> Result<impl Reply> {
-    clients
-        .read()
-        .await
-        .iter()
-        .filter(|(_, client)| match body.user_id {
-            Some(v) => client.user_id == v,
-            None => true,
-        })
-        .filter(|(_, client)| client.topics.contains(&body.topic))
-        .for_each(|(_, client)| {
-            if let Some(sender) = &client.sender {
-                let _ = sender.send(Ok(Message::text(body.message.clone())));
-            }
-        });
-
-    Ok(StatusCode::OK)
-}
-
-pub async fn register_handler(body: RegisterRequest, clients: Clients) -> Result<impl Reply> {
-    let user_id = body.user_id;
-    let uuid = Uuid::new_v4().simple().to_string();
-
-    register_client(uuid.clone(), user_id, clients).await;
-    Ok(json(&RegisterResponse {
-        url: format!("ws://127.0.0.1:8000/ws/{}", uuid),
-    }))
-}
-
-async fn register_client(id: String, user_id: usize, clients: Clients) {
-    clients.write().await.insert(
-        id,
-        Client {
-            user_id,
-            topics: vec![String::from("cats")],
-            sender: None,
-        },
-    );
-}
-
-pub async fn unregister_handler(id: String, clients: Clients) -> Result<impl Reply> {
-    clients.write().await.remove(&id);
-    Ok(StatusCode::OK)
-}
-
-pub async fn ws_handler(ws: warp::ws::Ws, id: String, clients: Clients) -> Result<impl Reply> {
-    let client = clients.read().await.get(&id).cloned();
-    match client {
-        Some(c) => Ok(ws.on_upgrade(move |socket| ws::client_connection(socket, id, clients, c))),
-        None => Err(warp::reject::not_found()),
-    }
+pub async fn ws_handler(ws: warp::ws::Ws, clients: Clients, app_cache: RedisCache) -> Result<impl Reply> {
+    Ok(ws.on_upgrade(move |socket| ws::client_connection(socket, clients, app_cache)))
 }
 
 pub async fn health_handler() -> Result<impl Reply> {
     Ok(StatusCode::OK)
+}
+
+pub async fn call_resource_handler(instance_id: String, resource: String, clients: Clients, app_cache: RedisCache) -> Result<impl Reply> {
+    let client_result = clients.read().await.get(&instance_id).cloned();
+    if !client_result.is_some() {
+        debug!("no such client: {}", instance_id);
+        return Err(warp::reject::not_found());
+    }
+
+    let client = client_result.unwrap();
+
+    debug!("found client: {}", instance_id);
+    let uid = Uuid::new_v4().to_string();
+    for sender in client.sender {
+        let message = WSCallResourceRequest {
+            message_type: "request".to_string(),
+            uid: uid.clone(),
+            resource: resource.clone(),
+        };
+        let request_json = serde_json::to_string(&message).unwrap();
+        debug!("{:?}", request_json);
+        match sender.send(Ok(Message::text(request_json))) {
+            Ok(()) => (),
+            Err(e) => {
+                // warn!("Handle Request: {:?}", e);
+                // return Ok(StatusCode::OK);
+                error!("Handle Request: {:?}", e);
+                return Err(warp::reject::not_found());
+            }
+        }
+    }
+
+    let mut counter = 0;
+    while counter < 60 {
+        let status_code = app_cache.get_safe(format!("response_{}_status", uid).as_str());
+        if status_code == String::from("") {
+            debug!("no response for request {}", uid);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            counter += 1;
+            continue;
+        }
+        debug!("got response, status_code: {}", status_code);
+        let reply = warp::reply();
+        let status_code_obj = StatusCode::from_u16(status_code.as_str().parse().unwrap()).unwrap();
+        let body = app_cache.get_safe(format!("response_{}_body", uid).as_str());
+        return Ok(with_status(body, status_code_obj));
+    }
+
+    Ok(with_status(String::from(""), StatusCode::OK))
 }

@@ -1,7 +1,8 @@
 use crate::cache::Cache;
-use redis::{Client, Commands};
+use redis::{Client, Commands, RedisResult};
 use std::error::Error;
 
+#[derive(Clone)]
 pub struct RedisCache {
     client: Client,
 }
@@ -22,6 +23,25 @@ impl Cache for RedisCache {
     fn get(&self, key_name: &str) -> Result<String, Box<dyn Error>> {
         let mut connection = self.client.get_connection()?;
         let result = connection.get(key_name)?;
+        Ok(result)
+    }
+    fn get_safe(&self, key_name: &str) -> String {
+        let connection_result = self.client.get_connection();
+        if connection_result.is_err() {
+            return String::from("");
+        }
+        let mut connection = connection_result.unwrap();
+
+        let result: RedisResult<String> = connection.get(key_name);
+        if result.is_err() {
+            return String::from("");
+        }
+
+        return String::from(result.unwrap());
+    }
+    fn set(&self, key_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+        let mut connection = self.client.get_connection()?;
+        let result = connection.set(key_name, value)?;
         Ok(result)
     }
 }
