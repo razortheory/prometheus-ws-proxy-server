@@ -70,16 +70,29 @@ pub async fn call_resource_handler(instance_id: String, resource: String, client
     senders.shuffle(&mut thread_rng());
 
     for (key, sender) in senders {
-        let message = WSReadyRequest {
-            message_type: "ready".to_string(),
-            uid: uid.clone(),
-        };
-        let request_json = serde_json::to_string(&message).unwrap();
+        let request_json: String;
+        if client.version == 1 {
+            let message = WSCallResourceRequest {
+                message_type: "request".to_string(),
+                uid: uid.clone(),
+                resource: resource.clone(),
+            };
+            request_json = serde_json::to_string(&message).unwrap();
+        } else {
+            let message = WSReadyRequest {
+                message_type: "ready".to_string(),
+                uid: uid.clone(),
+            };
+            request_json = serde_json::to_string(&message).unwrap();
+        }
+
         match sender.send(Ok(Message::text(request_json))) {
             Ok(()) => {
                 // we send request to every worker, so no break required
                 // debug!("message sent");
-                // break;
+                if client.version == 1 {
+                    break;
+                }
             },
             Err(e) => {
                 error!("Handle Request: {:?}", e);
@@ -90,27 +103,29 @@ pub async fn call_resource_handler(instance_id: String, resource: String, client
         }
     }
 
-    let worker_name = wait_for_worker_available(app_cache.clone(), uid.clone()).await;
-    if worker_name == "" {
-        error!("unable to find worker for {}", uid);
-        // todo: return better error response
-        return Err(warp::reject::not_found());
-    }
+    if client.version > 1 {
+        let worker_name = wait_for_worker_available(app_cache.clone(), uid.clone()).await;
+        if worker_name == "" {
+            error!("unable to find worker for {}", uid);
+            // todo: return better error response
+            return Err(warp::reject::not_found());
+        }
 
-    let sender = client.senders.get(&worker_name).unwrap();
-    let message = WSCallResourceRequest {
-        message_type: "request".to_string(),
-        uid: uid.clone(),
-        resource: resource.clone(),
-    };
-    let request_json = serde_json::to_string(&message).unwrap();
-    match sender.send(Ok(Message::text(request_json))) {
-        Ok(()) => {
-            debug!("message sent");
-        },
-        Err(e) => {
-            error!("Handle Request: {:?}", e);
-            // todo: close socket
+        let sender = client.senders.get(&worker_name).unwrap();
+        let message = WSCallResourceRequest {
+            message_type: "request".to_string(),
+            uid: uid.clone(),
+            resource: resource.clone(),
+        };
+        let request_json = serde_json::to_string(&message).unwrap();
+        match sender.send(Ok(Message::text(request_json))) {
+            Ok(()) => {
+                debug!("message sent");
+            },
+            Err(e) => {
+                error!("Handle Request: {:?}", e);
+                // todo: close socket
+            }
         }
     }
 

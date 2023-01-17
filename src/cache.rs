@@ -5,4 +5,5 @@ pub trait Cache {
     fn get_safe(&self, key_name: &str) -> String;
     fn set(&self, key_name: &str, value: String) -> Result<(), Box<dyn Error>>;
     fn set_if_not_exists(&self, key_name: &str, value: String) -> Result<(), Box<dyn Error>>;
+    fn set_timeout(&self, key_name: &str, seconds: usize) -> Result<(), Box<dyn Error>>;
 }

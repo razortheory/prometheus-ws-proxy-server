@@ -6,6 +6,7 @@ use serde_json::{from_str, Value};
 use serde_valid::json::FromJsonValue;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use uuid::Uuid;
 use warp::ws::WebSocket;
 use crate::ws_clients::{Client, Clients};
 use crate::ws_request::{WSProxyCallResponse, WSProxyReadyResponse, WSRegisterRequest, WSRequest};
@@ -17,11 +18,6 @@ pub async fn client_connection(ws: WebSocket, clients: Clients, app_cache: Redis
     let client_rcv = UnboundedReceiverStream::new(client_rcv);
 
     tokio::task::spawn(client_rcv.forward(client_ws_sender));
-    // tokio::task::spawn(client_rcv.forward(client_ws_sender).map(|result| {
-    //     if let Err(e) = result {
-    //         eprintln!("error sending websocket msg: {}", e);
-    //     }
-    // }));
 
     debug!("someone connected");
 
@@ -62,22 +58,29 @@ pub async fn client_connection(ws: WebSocket, clients: Clients, app_cache: Redis
                                 break;
                             }
                             let request = request_result.unwrap();
-                            debug!("{:?}", request);
+                            debug!("new register request: {:?}", request);
                             let instance_id = request.instance;
-                            info!("registering worker {} for instance {}", request.worker, instance_id);
 
-                            // todo: handle version 1
+                            let worker_name: String;
+                            if request.worker == "unknown" {
+                                worker_name = Uuid::new_v4().to_string();
+                            } else {
+                                worker_name = request.worker;
+                            }
+
+                            info!("registering worker {} for instance {}", worker_name, instance_id);
+
                             // todo: block access to writer
                             let mut writer = clients.write().await;
                             if writer.contains_key(instance_id.clone().as_str()) {
-                                debug!("found client, attaching new sender.");
+                                debug!("client exists, attaching new sender.");
                                 let client = writer.get(instance_id.clone().as_str()).unwrap().clone();
                                 let mut sender = client.senders;
-                                sender.insert(request.worker, client_sender);
+                                sender.insert(worker_name, client_sender);
                                 debug!("{} sockets exists", sender.len());
                                 writer.insert(
                                     instance_id.clone(),
-                                    Client {instance_id, senders: sender }
+                                    Client { instance_id, senders: sender, version: request.version },
                                 );
                             } else {
                                 writer.insert(
@@ -85,8 +88,9 @@ pub async fn client_connection(ws: WebSocket, clients: Clients, app_cache: Redis
                                     Client {
                                         instance_id: instance_id.clone(),
                                         senders: HashMap::from([
-                                            (request.worker, client_sender),
+                                            (worker_name, client_sender),
                                         ]),
+                                        version: request.version,
                                     },
                                 );
                                 info!("client was created successfully");
@@ -106,8 +110,14 @@ pub async fn client_connection(ws: WebSocket, clients: Clients, app_cache: Redis
                             }
                             let request = request_result.unwrap();
                             debug!("{:?}", request);
-                            app_cache.set(format!("response_{}_body", request.uid).as_str(), request.body).unwrap();
-                            app_cache.set(format!("response_{}_status", request.uid).as_str(), request.status.to_string()).unwrap();
+
+                            let body_cache_key = format!("response_{}_body", request.uid);
+                            app_cache.set(body_cache_key.as_str(), request.body).unwrap();
+                            app_cache.set_timeout(body_cache_key.as_str(), 60).unwrap();
+
+                            let status_cache_key = format!("response_{}_status", request.uid);
+                            app_cache.set(status_cache_key.as_str(), request.status.to_string()).unwrap();
+                            app_cache.set_timeout(status_cache_key.as_str(), 60).unwrap();
                         }
                         "ready" => {
                             let request_result = WSProxyReadyResponse::from_json_value(json_value);
@@ -119,7 +129,9 @@ pub async fn client_connection(ws: WebSocket, clients: Clients, app_cache: Redis
                             }
                             let request = request_result.unwrap();
                             debug!("{} ready to process {}", request.worker, request.uid);
-                            app_cache.set_if_not_exists(format!("response_{}_ready", request.uid).as_str(), request.worker).unwrap();
+                            let ready_cache_key = format!("response_{}_ready", request.uid);
+                            app_cache.set_if_not_exists(ready_cache_key.as_str(), request.worker).unwrap();
+                            app_cache.set_timeout(ready_cache_key.as_str(), 60).unwrap();
                         }
                         _ => {
                             debug!("unknown type");
@@ -128,35 +140,5 @@ pub async fn client_connection(ws: WebSocket, clients: Clients, app_cache: Redis
                 }
             }
         }
-
-        // client_msg(&id, msg, &clients).await;
     }
-
-    // clients.write().await.remove(&id);
-    // println!("{} disconnected", id);
 }
-
-// async fn client_msg(id: &str, msg: Message, clients: &Clients) {
-//     println!("received message from {}: {:?}", id, msg);
-//     let message = match msg.to_str() {
-//         Ok(v) => v,
-//         Err(_) => return,
-//     };
-//
-//     if message == "ping" || message == "ping\n" {
-//         return;
-//     }
-//
-//     let topics_req: TopicsRequest = match from_str(&message) {
-//         Ok(v) => v,
-//         Err(e) => {
-//             eprintln!("error while parsing message to topics request: {}", e);
-//             return;
-//         }
-//     };
-//
-//     let mut locked = clients.write().await;
-//     if let Some(v) = locked.get_mut(id) {
-//         v.topics = topics_req.topics;
-//     }
-// }

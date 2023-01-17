@@ -8,7 +8,8 @@ use tokio::sync::{mpsc, RwLock};
 #[derive(Debug, Clone)]
 pub struct Client {
     pub instance_id: String,
-    pub senders: HashMap<String, mpsc::UnboundedSender<Result<Message, warp::Error>>>
+    pub senders: HashMap<String, mpsc::UnboundedSender<Result<Message, warp::Error>>>,
+    pub version: u16,
 }
 
 pub type Clients = Arc<RwLock<HashMap<String, Client>>>;
@@ -22,6 +23,6 @@ pub async fn remove_client(clients: &Clients, instance_id: String, sender_id: St
     debug!("{} sockets exists", senders.len());
     writer.insert(
         instance_id.clone(),
-        Client {instance_id, senders }
+        Client {instance_id, senders, version: client.version }
     );
 }
