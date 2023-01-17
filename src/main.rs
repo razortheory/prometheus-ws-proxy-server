@@ -1,15 +1,16 @@
 use clap::{arg, Command};
-use log::{info};
+use log::info;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
-use std::sync::{Arc};
-use tokio::sync::{mpsc, RwLock};
-use warp::{ws::Message, Filter, Rejection};
+use std::sync::Arc;
+use tokio::sync::{RwLock};
+use warp::{Filter, Rejection};
 
 use crate::cache::Cache;
 use crate::cache_redis::RedisCache;
+use crate::ws_clients::{Clients};
 
 mod handler;
 mod ws;
@@ -17,15 +18,9 @@ mod ws_request;
 mod cache;
 mod cache_redis;
 mod ws_response;
+mod ws_clients;
 
 type WSResult<T> = Result<T, Rejection>;
-type Clients = Arc<RwLock<HashMap<String, Client>>>;
-
-#[derive(Debug, Clone)]
-pub struct Client {
-    pub instance_id: String,
-    pub sender: Vec<mpsc::UnboundedSender<Result<Message, warp::Error>>>
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {

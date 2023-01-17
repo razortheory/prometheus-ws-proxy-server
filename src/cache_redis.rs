@@ -44,4 +44,9 @@ impl Cache for RedisCache {
         let result = connection.set(key_name, value)?;
         Ok(result)
     }
+    fn set_if_not_exists(&self, key_name: &str, value: String) -> Result<(), Box<dyn Error>> {
+        let mut connection = self.client.get_connection()?;
+        let result = connection.set_nx(key_name, value)?;
+        Ok(result)
+    }
 }

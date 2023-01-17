@@ -1412,6 +1412,7 @@ dependencies = [
  "futures 0.3.21",
  "log 0.4.17",
  "once_cell",
+ "rand 0.8.5",
  "redis",
  "regex",
  "serde",

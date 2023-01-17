@@ -1,32 +1,29 @@
+use std::collections::HashMap;
 use futures::StreamExt;
-use futures::FutureExt;
-use crate::{Cache, Client, Clients, RedisCache};
+use log::{debug, info, warn};
+use crate::{Cache, RedisCache};
 use serde_json::{from_str, Value};
 use serde_valid::json::FromJsonValue;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use warp::ws::{Message, WebSocket};
-use crate::ws_request::{WSProxyCallResponse, WSRegisterRequest, WSRequest};
+use warp::ws::WebSocket;
+use crate::ws_clients::{Client, Clients};
+use crate::ws_request::{WSProxyCallResponse, WSProxyReadyResponse, WSRegisterRequest, WSRequest};
 
-// #[derive(Deserialize, Debug)]
-// pub struct TopicsRequest {
-//     topics: Vec<String>,
-// }
 
 pub async fn client_connection(ws: WebSocket, clients: Clients, app_cache: RedisCache) {
     let (client_ws_sender, mut client_ws_rcv) = ws.split();
     let (client_sender, client_rcv) = unbounded_channel();
     let client_rcv = UnboundedReceiverStream::new(client_rcv);
 
-    tokio::task::spawn(client_rcv.forward(client_ws_sender).map(|result| {
-        if let Err(e) = result {
-            eprintln!("error sending websocket msg: {}", e);
-        }
-    }));
+    tokio::task::spawn(client_rcv.forward(client_ws_sender));
+    // tokio::task::spawn(client_rcv.forward(client_ws_sender).map(|result| {
+    //     if let Err(e) = result {
+    //         eprintln!("error sending websocket msg: {}", e);
+    //     }
+    // }));
 
-    println!("someone connected");
-
-    // let mut instance_id = String::from("unknown");
+    debug!("someone connected");
 
     while let Some(result) = client_ws_rcv.next().await {
         // todo: respond ping
@@ -35,17 +32,17 @@ pub async fn client_connection(ws: WebSocket, clients: Clients, app_cache: Redis
         let msg = match result {
             Ok(msg) => msg,
             Err(e) => {
-                eprintln!("error receiving ws message: {}", e);
+                warn!("error receiving ws message: {}", e);
                 break;
             }
         };
         let request_str = msg.to_str().unwrap();
-        println!("received {}", request_str);
+        debug!("received {}", request_str);
         let json_value: Value = from_str(request_str).unwrap();
         let request_enum_result = WSRequest::from_json_value(json_value);
         if request_enum_result.is_err() {
             // should never happen
-            println!("{}", request_enum_result.unwrap_err().as_validation_errors().unwrap().to_string());
+            warn!("{}", request_enum_result.unwrap_err().as_validation_errors().unwrap().to_string());
             break;
         }
 
@@ -60,56 +57,72 @@ pub async fn client_connection(ws: WebSocket, clients: Clients, app_cache: Redis
                             let request_result = WSRegisterRequest::from_json_value(json_value);
                             if request_result.is_err() {
                                 // todo: handle missing fields
-                                println!("{:?}", request_result.unwrap_err());
+                                warn!("{:?}", request_result.unwrap_err());
                                 // println!("{}", request_result.unwrap_err().as_validation_errors().unwrap().to_string());
                                 break;
                             }
                             let request = request_result.unwrap();
-                            println!("{:?}", request);
+                            debug!("{:?}", request);
                             let instance_id = request.instance;
-                            println!("registering instance {}", instance_id);
+                            info!("registering worker {} for instance {}", request.worker, instance_id);
 
+                            // todo: handle version 1
+                            // todo: block access to writer
                             let mut writer = clients.write().await;
                             if writer.contains_key(instance_id.clone().as_str()) {
-                                println!("found client, attaching new sender.");
+                                debug!("found client, attaching new sender.");
                                 let client = writer.get(instance_id.clone().as_str()).unwrap().clone();
-                                let mut sender = client.sender;
-                                println!("{} sockets exists", sender.len());
-                                sender.push(client_sender);
+                                let mut sender = client.senders;
+                                sender.insert(request.worker, client_sender);
+                                debug!("{} sockets exists", sender.len());
                                 writer.insert(
                                     instance_id.clone(),
-                                    Client {instance_id, sender}
+                                    Client {instance_id, senders: sender }
                                 );
                             } else {
                                 writer.insert(
                                     instance_id.clone(),
                                     Client {
                                         instance_id: instance_id.clone(),
-                                        sender: vec![client_sender.clone()],
-                                    }
+                                        senders: HashMap::from([
+                                            (request.worker, client_sender),
+                                        ]),
+                                    },
                                 );
-                                println!("client was created successfully");
+                                info!("client was created successfully");
                             }
-                        },
+                        }
                         "ping" => {
-                            println!("ping");
+                            debug!("ping");
                             // todo: check socket exists in client structure
-                        },
+                        }
                         "response" => {
                             let request_result = WSProxyCallResponse::from_json_value(json_value);
                             if request_result.is_err() {
                                 // todo: handle missing fields
-                                println!("{:?}", request_result.unwrap_err());
+                                debug!("{:?}", request_result.unwrap_err());
                                 // println!("{}", request_result.unwrap_err().as_validation_errors().unwrap().to_string());
                                 break;
                             }
                             let request = request_result.unwrap();
-                            println!("{:?}", request);
+                            debug!("{:?}", request);
                             app_cache.set(format!("response_{}_body", request.uid).as_str(), request.body).unwrap();
                             app_cache.set(format!("response_{}_status", request.uid).as_str(), request.status.to_string()).unwrap();
                         }
+                        "ready" => {
+                            let request_result = WSProxyReadyResponse::from_json_value(json_value);
+                            if request_result.is_err() {
+                                // todo: handle missing fields
+                                debug!("{:?}", request_result.unwrap_err());
+                                // println!("{}", request_result.unwrap_err().as_validation_errors().unwrap().to_string());
+                                break;
+                            }
+                            let request = request_result.unwrap();
+                            debug!("{} ready to process {}", request.worker, request.uid);
+                            app_cache.set_if_not_exists(format!("response_{}_ready", request.uid).as_str(), request.worker).unwrap();
+                        }
                         _ => {
-                            println!("unknown type");
+                            debug!("unknown type");
                         }
                     }
                 }
