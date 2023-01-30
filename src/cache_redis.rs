@@ -25,19 +25,19 @@ impl Cache for RedisCache {
         let result = connection.get(key_name)?;
         Ok(result)
     }
-    fn get_safe(&self, key_name: &str) -> String {
+    fn get_safe(&self, key_name: &str) -> Option<String> {
         let connection_result = self.client.get_connection();
         if connection_result.is_err() {
-            return String::from("");
+            return None;
         }
         let mut connection = connection_result.unwrap();
 
         let result: RedisResult<String> = connection.get(key_name);
         if result.is_err() {
-            return String::from("");
+            return None;
         }
 
-        return String::from(result.unwrap());
+        return Some(String::from(result.unwrap()));
     }
     fn set(&self, key_name: &str, value: String) -> Result<(), Box<dyn Error>> {
         let mut connection = self.client.get_connection()?;
@@ -45,7 +45,6 @@ impl Cache for RedisCache {
         Ok(result)
     }
     fn set_if_not_exists(&self, key_name: &str, value: String) -> Result<(), Box<dyn Error>> {
-        // todo: return boolean
         let mut connection = self.client.get_connection()?;
         let result = connection.set_nx(key_name, value)?;
         Ok(result)

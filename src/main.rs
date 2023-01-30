@@ -1,24 +1,27 @@
+#![feature(future_join)]
+
 use clap::{arg, Command};
 use log::info;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
+use std::future::join;
 use std::sync::Arc;
-use tokio::sync::{RwLock};
+use tokio::sync::RwLock;
 use warp::{Filter, Rejection};
 
 use crate::cache::Cache;
 use crate::cache_redis::RedisCache;
-use crate::ws_clients::{Clients};
+use crate::ws_clients::Clients;
 
-mod handler;
-mod ws;
-mod ws_request;
 mod cache;
 mod cache_redis;
-mod ws_response;
+mod handler;
+mod ws;
 mod ws_clients;
+mod ws_request;
+mod ws_response;
 
 type WSResult<T> = Result<T, Rejection>;
 
@@ -29,12 +32,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let matches = Command::new("Prometheus websocket server")
         .version("2.0.0")
         .author("Roman Karpovich <fpm.th13f@gmail.com>")
-        .about("Proxy prometheus requests with no additional config")
-        .args(&[
-            arg!([config] "path to config")
-                .default_value("client_config.json"),
-        ]
-        )
+        .about("Proxy prometheus requests with no network hassle")
+        .args(&[arg!([config] "path to config").default_value("client_config.json")])
         .get_matches();
 
     let config_path = matches.get_one::<String>("config").unwrap();
@@ -52,11 +51,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         base_prefix = base_prefix.and(warp::path(url_prefix)).boxed();
     }
 
-    let health_route = base_prefix.clone()
+    let health_route = base_prefix
+        .clone()
         .and(warp::path!("health"))
         .and_then(handler::health_handler);
 
-    let ws_route = base_prefix.clone()
+    let ws_route = base_prefix
+        .clone()
         .and(warp::path!("ws"))
         // .and(log_body())
         // .map(warp::reply).with(log)
@@ -65,8 +66,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .and(with_cache(app_cache.clone()))
         .and_then(handler::ws_handler);
 
-    let call_resource = base_prefix.clone()
-        .and(warp::path!("request"/String/String))
+    let call_resource = base_prefix
+        .clone()
+        .and(warp::path!("request" / String / String))
         .and(with_clients(clients.clone()))
         .and(with_cache(app_cache.clone()))
         .and_then(handler::call_resource_handler);
@@ -76,7 +78,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .or(ws_route)
         .with(warp::cors().allow_any_origin());
 
-    warp::serve(routes).run((host, port)).await;
+    let ping_clients = ws_clients::ping_clients(&clients);
+    let run_server = warp::serve(routes).run((host, port));
+
+    join!(run_server, ping_clients).await;
 
     Ok(())
 }
@@ -85,6 +90,8 @@ fn with_clients(clients: Clients) -> impl Filter<Extract = (Clients,), Error = I
     warp::any().map(move || clients.clone())
 }
 
-fn with_cache(cache: RedisCache) -> impl Filter<Extract = (RedisCache,), Error = Infallible> + Clone {
+fn with_cache(
+    cache: RedisCache,
+) -> impl Filter<Extract = (RedisCache,), Error = Infallible> + Clone {
     warp::any().map(move || cache.clone())
 }

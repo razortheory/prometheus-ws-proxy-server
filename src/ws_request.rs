@@ -10,7 +10,6 @@ fn default_version() -> u16 {
     1
 }
 
-// todo: optional worker and version
 #[derive(Validate, Deserialize, Debug)]
 pub struct WSRegisterRequest {
     #[serde(rename(deserialize = "type"))]
