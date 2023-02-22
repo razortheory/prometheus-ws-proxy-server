@@ -7,16 +7,19 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
 use std::future::join;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use warp::{Filter, Rejection};
 
 use crate::cache::Cache;
 use crate::cache_redis::RedisCache;
+use crate::config::Config;
 use crate::ws_clients::Clients;
 
 mod cache;
 mod cache_redis;
+mod config;
 mod handler;
 mod ws;
 mod ws_clients;
@@ -38,13 +41,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config_path = matches.get_one::<String>("config").unwrap();
     info!("Using config {}", config_path);
+    let config = Config::from_file(config_path).unwrap();
 
-    let url_prefix = "proxy";
-    let port = 8081;
-    let host = [0, 0, 0, 0];
+    let url_prefix = config.url_prefix;
+    let port = config.port;
+    let host = config.host.parse::<Ipv4Addr>().expect("Invalid host");
 
     let clients: Clients = Arc::new(RwLock::with_max_readers(HashMap::new(), 1));
-    let app_cache = RedisCache::init("redis://localhost:6379/0");
+    let app_cache = RedisCache::init(
+        format!(
+            "redis://{}:{}/{}",
+            config.redis.host, config.redis.port, config.redis.db
+        )
+        .as_str(),
+    );
 
     let mut base_prefix = warp::any().boxed();
     if url_prefix != "" {
