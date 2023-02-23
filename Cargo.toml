@@ -20,6 +20,4 @@ regex = "1.6"
 futures = { version = "0.3", default-features = false }
 uuid = { version = "1.2", features = ["serde", "v4"] }
 redis = { version = "0.22.2", features = ["tls"] }
-websocket = "0.26"
-async-std = "1.12"
 rand = "0.8.5"

@@ -112,7 +112,7 @@ pub async fn ping_clients(clients: &Clients) {
 
 pub async fn wait_for_worker_available(app_cache: RedisCache, uid: String) -> Option<String> {
     let mut counter = 0;
-    while counter < 100 {
+    while counter < 300 {
         let worker_ready_result = app_cache.get_safe(format!("response_{}_ready", uid).as_str());
         if worker_ready_result.is_none() {
             debug!("no workers ready yet for request {}", uid);
@@ -129,11 +129,11 @@ pub async fn wait_for_worker_available(app_cache: RedisCache, uid: String) -> Op
 
 pub async fn wait_for_response(app_cache: RedisCache, uid: String) -> Option<WSResult<impl Reply>> {
     let mut counter = 0;
-    while counter < 60 {
+    while counter < 200 {
         let status_code_result = app_cache.get_safe(format!("response_{}_status", uid).as_str());
         if status_code_result.is_none() {
             debug!("no response for request {}", uid);
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
             counter += 1;
             continue;
         }
