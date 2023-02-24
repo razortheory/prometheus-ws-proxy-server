@@ -3,7 +3,8 @@ name = "prometheus-proxy-server"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[profile.release]
+debug = true
 
 [dependencies]
 clap = { version = "4.0.32", features = ["derive"]}
@@ -21,3 +22,4 @@ futures = { version = "0.3", default-features = false }
 uuid = { version = "1.2", features = ["serde", "v4"] }
 redis = { version = "0.22.2", features = ["tls"] }
 rand = "0.8.5"
+sentry = "0.29.3"

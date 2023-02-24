@@ -1,7 +1,7 @@
 #![feature(future_join)]
 
-use clap::{arg, Command};
-use log::info;
+use clap::{arg, value_parser, ArgAction, Command};
+use log::{debug, info};
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -36,8 +36,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .version("2.0.0")
         .author("Roman Karpovich <fpm.th13f@gmail.com>")
         .about("Proxy prometheus requests with no network hassle")
-        .args(&[arg!([config] "path to config").default_value("client_config.json")])
+        .args(&[
+            arg!([config] "path to config").default_value("client_config.json"),
+            arg!(--sentry_dsn ... "sentry DSN")
+                .action(ArgAction::Set)
+                .value_parser(value_parser!(String)),
+        ])
         .get_matches();
+
+    let sentry_dsn = matches.get_one::<String>("sentry_dsn");
+    let _guard;
+    match sentry_dsn {
+        Some(sentry_dsn) => {
+            debug!("got {} as sentry dsn", sentry_dsn);
+            _guard = sentry::init((
+                sentry_dsn.clone(),
+                sentry::ClientOptions {
+                    release: sentry::release_name!(),
+                    attach_stacktrace: true,
+                    ..Default::default()
+                },
+            ));
+            info!("Sentry configured");
+        }
+        None => {
+            info!("Sentry not configured");
+        }
+    };
 
     let config_path = matches.get_one::<String>("config").unwrap();
     info!("Using config {}", config_path);
