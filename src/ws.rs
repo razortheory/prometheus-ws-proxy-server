@@ -168,20 +168,17 @@ pub async fn client_connection(ws: WebSocket, clients: Clients, app_cache: Redis
                     }
                 }
             }
-        }
-        if msg.is_pong() {
+        } else if msg.is_pong() {
             debug!("pong received");
-        }
-        if msg.is_ping() {
-            debug!("pong received");
-            // todo: respond ping
-        }
-        if msg.is_close() {
+        } else if msg.is_ping() {
+            let ping_message = msg.into_bytes();
+            debug!(
+                "ping received: {}",
+                String::from_utf8(ping_message).unwrap()
+            );
+        } else if msg.is_close() {
             debug!("close received");
-            // todo: how to properly close connection?
-            // client_ws_sender.close().await;
-        }
-        if msg.is_binary() {
+        } else if msg.is_binary() {
             warn!("binary data received");
         }
     }
