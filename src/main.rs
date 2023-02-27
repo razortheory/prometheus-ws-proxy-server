@@ -28,12 +28,14 @@ mod ws_response;
 
 type WSResult<T> = Result<T, Rejection>;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
 
     let matches = Command::new("Prometheus websocket server")
-        .version("2.0.0")
+        .version(VERSION)
         .author("Roman Karpovich <fpm.th13f@gmail.com>")
         .about("Proxy prometheus requests with no network hassle")
         .args(&[
