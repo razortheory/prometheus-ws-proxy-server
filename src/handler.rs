@@ -12,7 +12,10 @@ pub async fn ws_handler(
     clients: Clients,
     app_cache: RedisCache,
 ) -> WSResult<impl Reply> {
-    Ok(ws.on_upgrade(move |socket| ws::client_connection(socket, clients, app_cache)))
+    Ok(ws
+        .max_frame_size(64 * 1024 * 1024)
+        .max_message_size(64 * 1024 * 1024)
+        .on_upgrade(move |socket| ws::client_connection(socket, clients, app_cache)))
 }
 
 pub async fn health_handler() -> WSResult<impl Reply> {
