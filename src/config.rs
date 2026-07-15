@@ -20,7 +20,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Config, Box<dyn Error>> {
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Config, Box<dyn Error + Send + Sync>> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let c: Config = serde_json::from_reader(reader)?;

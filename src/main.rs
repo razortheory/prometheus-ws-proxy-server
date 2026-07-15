@@ -1,134 +1,145 @@
-#![feature(future_join)]
-
-use clap::{arg, value_parser, ArgAction, Command};
-use log::{debug, info};
-
-use std::collections::HashMap;
-use std::convert::Infallible;
+use clap::{ArgAction, Parser};
+use prometheus_proxy_server::{build_router, config::Config, AppState};
 use std::error::Error;
-use std::future::join;
-use std::net::Ipv4Addr;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use warp::{Filter, Rejection};
-
-use crate::cache::Cache;
-use crate::cache_redis::RedisCache;
-use crate::config::Config;
-use crate::ws_clients::Clients;
-
-mod cache;
-mod cache_redis;
-mod config;
-mod handler;
-mod ws;
-mod ws_clients;
-mod ws_request;
-mod ws_response;
-
-type WSResult<T> = Result<T, Rejection>;
+use std::future::IntoFuture;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Parser)]
+#[command(
+    name = "Prometheus websocket server",
+    version = VERSION,
+    author = "Roman Karpovich <fpm.th13f@gmail.com>",
+    about = "Proxy prometheus requests with no network hassle"
+)]
+struct Cli {
+    #[arg(default_value = "client_config.json", help = "path to config")]
+    config: PathBuf,
+
+    #[arg(long = "sentry_dsn", help = "sentry DSN")]
+    sentry_dsn: Option<String>,
+
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        action = ArgAction::Count,
+        help = "increases log verbosity for each occurrence"
+    )]
+    verbose: u8,
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init();
-
-    let matches = Command::new("Prometheus websocket server")
-        .version(VERSION)
-        .author("Roman Karpovich <fpm.th13f@gmail.com>")
-        .about("Proxy prometheus requests with no network hassle")
-        .args(&[
-            arg!([config] "path to config").default_value("client_config.json"),
-            arg!(--sentry_dsn ... "sentry DSN")
-                .action(ArgAction::Set)
-                .value_parser(value_parser!(String)),
-        ])
-        .get_matches();
-
-    let sentry_dsn = matches.get_one::<String>("sentry_dsn");
-    let _guard;
-    match sentry_dsn {
-        Some(sentry_dsn) => {
-            debug!("got {} as sentry dsn", sentry_dsn);
-            _guard = sentry::init((
-                sentry_dsn.clone(),
-                sentry::ClientOptions {
-                    release: sentry::release_name!(),
-                    attach_stacktrace: true,
-                    ..Default::default()
-                },
-            ));
-            info!("Sentry configured");
-        }
-        None => {
-            info!("Sentry not configured");
-        }
-    };
-
-    let config_path = matches.get_one::<String>("config").unwrap();
-    info!("Using config {}", config_path);
-    let config = Config::from_file(config_path).unwrap();
-
-    let url_prefix = config.url_prefix;
-    let port = config.port;
-    let host = config.host.parse::<Ipv4Addr>().expect("Invalid host");
-
-    let clients: Clients = Arc::new(RwLock::with_max_readers(HashMap::new(), 1));
-    let app_cache = RedisCache::init(
-        format!(
-            "redis://{}:{}/{}",
-            config.redis.host, config.redis.port, config.redis.db
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let cli = Cli::parse();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(default_log_filter(cli.verbose))),
         )
-        .as_str(),
-    );
+        .try_init()?;
 
-    let mut base_prefix = warp::any().boxed();
-    if url_prefix != "" {
-        base_prefix = base_prefix.and(warp::path(url_prefix)).boxed();
+    let _sentry_guard = cli.sentry_dsn.map(|sentry_dsn| {
+        sentry::init((
+            sentry_dsn,
+            sentry::ClientOptions {
+                release: sentry::release_name!(),
+                attach_stacktrace: true,
+                ..Default::default()
+            },
+        ))
+    });
+
+    info!(config = %cli.config.display(), "loading configuration");
+    let config = Config::from_file(&cli.config)?;
+    let host: IpAddr = config.host.parse()?;
+    let address = SocketAddr::new(host, config.port);
+    let state = AppState::new();
+    let shutdown = state.shutdown_token();
+    let listener = tokio::net::TcpListener::bind(address).await?;
+
+    info!(%address, prefix = config.url_prefix, "server listening");
+    let signal_shutdown = shutdown.clone();
+    let _signal_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        signal_shutdown.cancel();
+    });
+    let graceful_shutdown = shutdown.clone();
+    let server = axum::serve(listener, build_router(&config.url_prefix, state))
+        .with_graceful_shutdown(graceful_shutdown.cancelled_owned())
+        .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        _ = async {
+            shutdown.cancelled().await;
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        } => {
+            tracing::warn!("graceful shutdown deadline reached; forcing exit");
+        }
     }
-
-    let health_route = base_prefix
-        .clone()
-        .and(warp::path!("health"))
-        .and_then(handler::health_handler);
-
-    let ws_route = base_prefix
-        .clone()
-        .and(warp::path!("ws"))
-        // .and(log_body())
-        // .map(warp::reply).with(log)
-        .and(warp::ws())
-        .and(with_clients(clients.clone()))
-        .and(with_cache(app_cache.clone()))
-        .and_then(handler::ws_handler);
-
-    let call_resource = base_prefix
-        .clone()
-        .and(warp::path!("request" / String / String))
-        .and(with_clients(clients.clone()))
-        .and(with_cache(app_cache.clone()))
-        .and_then(handler::call_resource_handler);
-
-    let routes = health_route
-        .or(call_resource)
-        .or(ws_route)
-        .with(warp::cors().allow_any_origin());
-
-    let ping_clients = ws_clients::ping_clients(&clients);
-    let run_server = warp::serve(routes).run((host, port));
-
-    join!(run_server, ping_clients).await;
-
     Ok(())
 }
 
-fn with_clients(clients: Clients) -> impl Filter<Extract = (Clients,), Error = Infallible> + Clone {
-    warp::any().map(move || clients.clone())
+fn default_log_filter(verbose: u8) -> &'static str {
+    match verbose {
+        0 | 1 => "info",
+        2 => "debug",
+        _ => "trace",
+    }
 }
 
-fn with_cache(
-    cache: RedisCache,
-) -> impl Filter<Extract = (RedisCache,), Error = Infallible> + Clone {
-    warp::any().map(move || cache.clone())
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_accepts_positional_config_and_verbose_count() {
+        let cli = Cli::try_parse_from(["proxy-server", "server.json", "-vvv"])
+            .expect("legacy CLI arguments should parse");
+
+        assert_eq!(cli.config, PathBuf::from("server.json"));
+        assert_eq!(cli.verbose, 3);
+
+        let cli = Cli::try_parse_from(["proxy-server", "server.json", "--verbose", "--verbose"])
+            .expect("long verbose option should remain repeatable");
+        assert_eq!(cli.verbose, 2);
+    }
+
+    #[test]
+    fn verbosity_maps_to_expected_default_filter() {
+        assert_eq!(default_log_filter(0), "info");
+        assert_eq!(default_log_filter(1), "info");
+        assert_eq!(default_log_filter(2), "debug");
+        assert_eq!(default_log_filter(3), "trace");
+        assert_eq!(default_log_filter(u8::MAX), "trace");
+    }
 }

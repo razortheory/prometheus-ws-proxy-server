@@ -1,26 +1,30 @@
 [package]
 name = "prometheus-proxy-server"
-version = "2.0.9"
+version = "3.0.0"
 edition = "2021"
+rust-version = "1.88"
 
 [profile.release]
-debug = true
+lto = "thin"
+strip = true
 
 [dependencies]
-proc-macro2 = { version = "1.0.66", features = ["default", "proc-macro"] }
-clap = { version = "4.0.32", features = ["derive"] }
-log = "0.4"
-env_logger = "0.10.0"
-tokio = { version = "1.19", features = ["full", "tracing"] }
-tokio-stream = "0.1.11"
-warp = "0.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_valid = "0.12.0"
-once_cell = "1.15"
-regex = "1.6"
-futures = { version = "0.3", default-features = false }
-uuid = { version = "1.2", features = ["serde", "v4"] }
-redis = { version = "0.22.2", features = ["tls"] }
-rand = "0.8.5"
-sentry = "0.29.3"
+axum = { version = "0.8.9", features = ["form", "http1", "json", "tokio", "ws"] }
+clap = { version = "4.6.1", features = ["derive"] }
+futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
+http = "1.4.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
+sentry = { version = "0.48.5", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls-no-provider"] }
+tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+tower-http = { version = "0.7.0", features = ["cors", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+uuid = { version = "1.23.5", features = ["v4"] }
+
+[dev-dependencies]
+reqwest = { version = "0.13.4", default-features = false, features = ["form"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
+tower = { version = "0.5.3", features = ["util"] }
