@@ -253,8 +253,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_worker_returns_unavailable_and_timeout_releases_it() {
-        let state = AppState::for_tests(Duration::from_millis(50), Duration::from_millis(50), 1024);
+    async fn busy_worker_returns_unavailable() {
+        let state = AppState::for_tests(Duration::from_millis(50), Duration::from_secs(5), 1024);
         let (address, shutdown, server) = test_server(state.clone()).await;
         let (mut socket, _) = connect_async(format!("ws://{address}/proxy/ws"))
             .await
@@ -272,15 +272,66 @@ mod tests {
         let first = tokio::spawn(reqwest::get(format!(
             "http://{address}/proxy/request/demo/node"
         )));
-        let _request = receive_json(&mut socket).await;
+        let request = receive_json(&mut socket).await;
         let second = reqwest::get(format!("http://{address}/proxy/request/demo/node"))
             .await
             .unwrap();
         assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        socket
+            .send(Message::Text(
+                json!({"type":"response","uid":request["uid"],"status":200,"body":"ok"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+        assert_eq!(state.debug_counts().await, (1, 0));
+
+        shutdown.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_timeout_releases_worker() {
+        let state = AppState::for_tests(Duration::from_millis(50), Duration::from_secs(1), 1024);
+        let (address, shutdown, server) = test_server(state.clone()).await;
+        let (mut socket, _) = connect_async(format!("ws://{address}/proxy/ws"))
+            .await
+            .unwrap();
+        socket
+            .send(Message::Text(
+                json!({"type":"register","instance":"demo","worker":"one","version":1})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        state.wait_for_worker_after("demo", "one", 0).await;
+
+        let get = tokio::spawn(reqwest::get(format!(
+            "http://{address}/proxy/request/demo/node"
+        )));
+        let _request = receive_json(&mut socket).await;
         assert_eq!(
-            first.await.unwrap().unwrap().status(),
+            get.await.unwrap().unwrap().status(),
             StatusCode::NOT_IMPLEMENTED
         );
+        assert_eq!(state.debug_counts().await, (1, 0));
+
+        let next = tokio::spawn(reqwest::get(format!(
+            "http://{address}/proxy/request/demo/node"
+        )));
+        let request = receive_json(&mut socket).await;
+        socket
+            .send(Message::Text(
+                json!({"type":"response","uid":request["uid"],"status":200,"body":"ok"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next.await.unwrap().unwrap().status(), StatusCode::OK);
         assert_eq!(state.debug_counts().await, (1, 0));
 
         shutdown.cancel();
