@@ -1,10 +1,10 @@
 # Prometheus WebSocket Proxy Server
 
-[![CI](https://github.com/roman-karpovich/prometheus-ws-proxy-server/actions/workflows/ci.yml/badge.svg)](https://github.com/roman-karpovich/prometheus-ws-proxy-server/actions/workflows/ci.yml)
+[![CI](https://github.com/razortheory/prometheus-ws-proxy-server/actions/workflows/ci.yml/badge.svg)](https://github.com/razortheory/prometheus-ws-proxy-server/actions/workflows/ci.yml)
 
 `prometheus-proxy-server` lets Prometheus scrape exporters behind NAT, firewalls, and private networks without opening inbound exporter ports. Proxy clients establish outbound WebSocket connections; the server maps normal Prometheus HTTP requests onto those connections and returns the exporter response.
 
-This is product version 3. It is a resource-bounded Rust replacement for the long-running Python service while preserving its routes, configuration shape, and historical wire protocols. The matching client is [prometheus-ws-proxy-client](https://github.com/roman-karpovich/prometheus-ws-proxy-client).
+This is product version 3. It is a resource-bounded Rust replacement for the long-running Python service while preserving its routes, configuration shape, and historical wire protocols. The matching client is [prometheus-ws-proxy-client](https://github.com/razortheory/prometheus-ws-proxy-client).
 
 ## How it works
 
@@ -39,7 +39,7 @@ Releases contain one stripped, static Linux amd64 binary and its checksum. Pin a
 
 ```bash
 VERSION=v3.0.0
-BASE="https://github.com/roman-karpovich/prometheus-ws-proxy-server/releases/download/${VERSION}"
+BASE="https://github.com/razortheory/prometheus-ws-proxy-server/releases/download/${VERSION}"
 curl -fLO "${BASE}/prometheus-proxy-server-linux-amd64"
 curl -fLO "${BASE}/prometheus-proxy-server-linux-amd64.sha256"
 sha256sum --check prometheus-proxy-server-linux-amd64.sha256
