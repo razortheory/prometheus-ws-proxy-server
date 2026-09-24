@@ -35,6 +35,10 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
+    #[cfg(unix)]
+    let _reload_task = tokio::spawn(ignore_reload_signal(tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::hangup(),
+    )?));
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -90,6 +94,16 @@ fn default_log_filter(verbose: u8) -> &'static str {
         0 | 1 => "info",
         2 => "debug",
         _ => "trace",
+    }
+}
+
+/// The systemd unit maps `reload` to SIGHUP, whose default action terminates
+/// the process and drops every worker connection without a close frame. The
+/// server has no reloadable state, so the signal is logged and ignored.
+#[cfg(unix)]
+async fn ignore_reload_signal(mut hangup: tokio::signal::unix::Signal) {
+    while hangup.recv().await.is_some() {
+        info!("SIGHUP received; nothing to reload, connections are kept");
     }
 }
 
