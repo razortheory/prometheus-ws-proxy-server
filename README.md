@@ -38,7 +38,7 @@ Wire v3 client delivery is transport-level at-least-once because a successful re
 Releases contain one stripped, static Linux amd64 binary and its checksum. Pin a version in automation:
 
 ```bash
-VERSION=v3.0.0
+VERSION=v3.0.1
 BASE="https://github.com/razortheory/prometheus-ws-proxy-server/releases/download/${VERSION}"
 curl -fLO "${BASE}/prometheus-proxy-server-linux-amd64"
 curl -fLO "${BASE}/prometheus-proxy-server-linux-amd64.sha256"
@@ -94,6 +94,21 @@ With `url_prefix: "proxy"`:
 
 An unknown instance returns `404`. A known instance with no available worker or exhausted bounded capacity returns `503`. A client response timeout returns `501`. Successful exporter responses preserve their status and body.
 
+`GET /metrics` (served at the root, independent of `url_prefix`) exposes the server's own Prometheus metrics. Scrape it on the loopback listener; the example Nginx configuration only forwards the prefixed routes.
+
+| Series | Meaning |
+| --- | --- |
+| `proxy_workers{version}` | Registered worker connections by wire version (`1`, `2`, `3`) |
+| `proxy_worker_registrations_total{version}` | Worker registrations, including reconnects |
+| `proxy_websocket_connections` | Open WebSocket connections, registered or not |
+| `proxy_websocket_closes_total{reason}` | Ended connections: `client_close`, `reset` (transport ended without a close frame), `receive_error`, `heartbeat_timeout`, `send_failed`, `replaced`, `shutdown` |
+| `proxy_scrapes_total{result}` | Scrapes by outcome: `proxied`, `unknown_instance`, `capacity`, `no_idle_worker`, `ready_timeout`, `worker_lost`, `response_timeout` |
+| `proxy_scrape_retries_total` | Scrapes re-dispatched after the selected worker disconnected |
+| `proxy_pending_requests`, `proxy_in_flight_requests` | Current request state |
+| `proxy_build_info{version}` | Running server version |
+
+A `worker disconnected` log line carries the same `reason` label.
+
 Example Nginx location:
 
 ```nginx
@@ -139,7 +154,7 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
-SIGINT and SIGTERM trigger graceful shutdown, bounded by 15 seconds inside the process.
+SIGINT and SIGTERM trigger graceful shutdown, bounded by 15 seconds inside the process. SIGHUP is logged and ignored: the server has no reloadable configuration, and a unit with `ExecReload=/bin/kill -HUP $MAINPID` would otherwise terminate the process and drop every worker connection on `systemctl reload`.
 
 ## Resource and failure bounds
 
@@ -149,8 +164,11 @@ SIGINT and SIGTERM trigger graceful shutdown, bounded by 15 seconds inside the p
 - 64 MiB maximum HTTP form body, WebSocket frame, and WebSocket message.
 - Ready-selection timeout: 30 seconds.
 - Exporter response timeout: 30 seconds.
-- Heartbeat every 15 seconds; stale connection timeout: 45 seconds.
+- Both timeouts are further limited by the `X-Prometheus-Scrape-Timeout-Seconds` request header, so the server stops waiting and releases the worker when Prometheus gives up. Without the header a scrape takes at most 60 seconds, including retries.
+- A scrape whose selected worker disconnects (or is replaced) before answering is retried on another worker, at most 3 attempts. When no other worker is available, the server waits up to 3 seconds for the instance to reconnect.
+- Heartbeat every 15 seconds; stale connection timeout: 45 seconds. A worker that has sent nothing for 30 seconds gets no new scrapes while its connection waits for the heartbeat decision.
 - WebSocket send timeout: 5 seconds.
+- A connection the server ends itself (heartbeat timeout, replacement by a new connection with the same worker name, shutdown) receives a close frame with that reason. A replaced connection ends immediately.
 
 Disconnected generations, empty instance maps, and completed or timed-out pending UIDs are removed. Capacity exhaustion fails fast instead of growing queues.
 
