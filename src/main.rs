@@ -35,6 +35,7 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cli = Cli::parse();
+    let shutdown_signals = ShutdownSignals::install()?;
     #[cfg(unix)]
     let _reload_task = tokio::spawn(ignore_reload_signal(tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::hangup(),
@@ -58,6 +59,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         ))
     });
 
+    info!("signal handlers installed");
     info!(config = %cli.config.display(), "loading configuration");
     let config = Config::from_file(&cli.config)?;
     let host: IpAddr = config.host.parse()?;
@@ -69,7 +71,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     info!(%address, prefix = config.url_prefix, "server listening");
     let signal_shutdown = shutdown.clone();
     let _signal_task = tokio::spawn(async move {
-        shutdown_signal().await;
+        if let Err(error) = shutdown_signals.recv().await {
+            tracing::error!(%error, "waiting for a shutdown signal failed");
+        }
         signal_shutdown.cancel();
     });
     let graceful_shutdown = shutdown.clone();
@@ -107,27 +111,46 @@ async fn ignore_reload_signal(mut hangup: tokio::signal::unix::Signal) {
     }
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
+/// SIGINT and SIGTERM streams created at startup. Creating a stream replaces
+/// the default action immediately; `tokio::signal::ctrl_c()` or a stream
+/// created later would leave a window in which the signal kills the process
+/// without a graceful shutdown.
+struct ShutdownSignals {
     #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
 
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+impl ShutdownSignals {
+    fn install() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt())?,
+                terminate: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Self {})
+    }
 
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
+    async fn recv(self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let Self {
+                mut interrupt,
+                mut terminate,
+            } = self;
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c().await
     }
 }
 
