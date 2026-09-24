@@ -1,7 +1,10 @@
 #![cfg(unix)]
 
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::io::{BufRead, BufReader};
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 struct Server(Child);
 
@@ -9,6 +12,38 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+fn describe(status: ExitStatus) -> String {
+    match status.signal() {
+        Some(signal) => format!("{status} (killed by signal {signal})"),
+        None => status.to_string(),
+    }
+}
+
+/// Waits for a log line containing `needle`, failing if the server exits.
+fn wait_for_line(server: &mut Child, lines: &mpsc::Receiver<String>, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match lines.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) if line.contains(needle) => return,
+            Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                let status = server.wait().unwrap();
+                panic!(
+                    "server exited before logging {needle:?}: {}",
+                    describe(status)
+                );
+            }
+        }
+        if let Some(status) = server.try_wait().unwrap() {
+            panic!(
+                "server exited before logging {needle:?}: {}",
+                describe(status)
+            );
+        }
+        assert!(Instant::now() < deadline, "server never logged {needle:?}");
     }
 }
 
@@ -48,11 +83,21 @@ async fn sighup_is_ignored_and_sigterm_still_stops_the_server() {
     let mut server = Server(
         Command::new(env!("CARGO_BIN_EXE_prometheus-proxy-server"))
             .arg(&config)
-            .stdout(Stdio::null())
+            .env_remove("RUST_LOG")
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap(),
     );
+    let (lines_tx, lines) = mpsc::channel();
+    let stdout = server.0.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = lines_tx.send(line);
+        }
+    });
+    // Logged only after every signal handler is registered.
+    wait_for_line(&mut server.0, &lines, "signal handlers installed");
     let started = tokio::time::timeout(Duration::from_secs(10), async {
         while !healthy(port).await {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -62,11 +107,7 @@ async fn sighup_is_ignored_and_sigterm_still_stops_the_server() {
     assert!(started.is_ok(), "server did not start");
 
     signal(&server.0, "HUP");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        server.0.try_wait().unwrap().is_none(),
-        "SIGHUP stopped the server"
-    );
+    wait_for_line(&mut server.0, &lines, "SIGHUP received");
     assert!(healthy(port).await);
 
     signal(&server.0, "TERM");
@@ -80,6 +121,8 @@ async fn sighup_is_ignored_and_sigterm_still_stops_the_server() {
     })
     .await
     .expect("SIGTERM did not stop the server");
-    assert!(stopped.success());
+    // A graceful shutdown returns from main; the default SIGTERM action
+    // would end the process by signal instead.
+    assert_eq!(stopped.code(), Some(0), "{}", describe(stopped));
     let _ = std::fs::remove_file(config);
 }
