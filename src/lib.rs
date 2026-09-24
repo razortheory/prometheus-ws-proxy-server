@@ -1,10 +1,13 @@
 pub mod config;
+mod metrics;
 mod server;
 
 pub use server::{build_router, AppState};
 
 #[cfg(test)]
 mod tests {
+    use super::metrics::{CloseReason, ScrapeOutcome};
+    use super::server::Limits;
     use super::{build_router, config::Config, AppState};
     use axum::body::Body;
     use futures_util::{SinkExt, StreamExt};
@@ -653,5 +656,332 @@ mod tests {
             .await
             .expect("server did not stop promptly")
             .unwrap();
+    }
+
+    fn fast_limits() -> Limits {
+        Limits {
+            ready_timeout: Duration::from_secs(1),
+            response_timeout: Duration::from_secs(1),
+            ..Limits::default()
+        }
+    }
+
+    async fn register<S>(socket: &mut S, instance: &str, worker: &str, version: u16)
+    where
+        S: SinkExt<Message> + Unpin,
+        <S as futures_util::Sink<Message>>::Error: std::fmt::Debug,
+    {
+        socket
+            .send(Message::Text(
+                json!({"type":"register","instance":instance,"worker":worker,"version":version})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// Reads until a close frame arrives and returns its reason.
+    async fn receive_close_reason<S>(socket: &mut S) -> String
+    where
+        S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Close(Some(frame)))) => return frame.reason.to_string(),
+                    Some(Ok(Message::Close(None))) => return String::new(),
+                    Some(Ok(_)) => continue,
+                    other => panic!("connection ended without a close frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("no close frame received")
+    }
+
+    #[tokio::test]
+    async fn replaced_connection_receives_close_frame_and_ends() {
+        let state = AppState::for_tests_with(fast_limits());
+        let (address, shutdown, server) = test_server(state.clone()).await;
+        let (mut old_socket, _) = connect_async(format!("ws://{address}/proxy/ws"))
+            .await
+            .unwrap();
+        register(&mut old_socket, "demo", "same", 3).await;
+        let old_generation = state.wait_for_worker_after("demo", "same", 0).await;
+        let (mut new_socket, _) = connect_async(format!("ws://{address}/proxy/ws"))
+            .await
+            .unwrap();
+        register(&mut new_socket, "demo", "same", 3).await;
+        state
+            .wait_for_worker_after("demo", "same", old_generation)
+            .await;
+
+        assert_eq!(
+            receive_close_reason(&mut old_socket).await,
+            "worker replaced"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.metrics().closes(CloseReason::Replaced) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replaced connection loop kept running");
+        assert_eq!(state.debug_counts().await, (1, 0));
+        shutdown.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_timeout_sends_close_frame() {
+        // The first tick already sees a timeout, so no ping precedes the
+        // close frame; a ping would make the client queue a pong that it then
+        // writes into the closed socket, and the resulting reset can discard
+        // the close frame before the test reads it.
+        let state = AppState::for_tests_with(Limits {
+            heartbeat_interval: Duration::from_millis(100),
+            heartbeat_timeout: Duration::from_millis(10),
+            ..fast_limits()
+        });
+        let (address, shutdown, server) = test_server(state.clone()).await;
+        let (mut socket, _) = connect_async(format!("ws://{address}/proxy/ws"))
+            .await
+            .unwrap();
+        register(&mut socket, "demo", "silent", 3).await;
+        let generation = state.wait_for_worker_after("demo", "silent", 0).await;
+
+        // Not polling the socket suppresses automatic pongs, so the server
+        // sees silence.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(receive_close_reason(&mut socket).await, "heartbeat timeout");
+        state
+            .wait_for_worker_removed("demo", "silent", generation)
+            .await;
+        assert_eq!(state.metrics().closes(CloseReason::HeartbeatTimeout), 1);
+        shutdown.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn silent_worker_is_skipped_for_dispatch() {
+        let state = AppState::for_tests_with(Limits {
+            stale_after: Duration::from_millis(150),
+            ..fast_limits()
+        });
+        let (address, shutdown, server) = test_server(state.clone()).await;
+        let (mut quiet, _) = connect_async(format!("ws://{address}/proxy/ws"))
+            .await
+            .unwrap();
+        register(&mut quiet, "demo", "quiet", 1).await;
+        state.wait_for_worker_after("demo", "quiet", 0).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let only_stale = reqwest::get(format!("http://{address}/proxy/request/demo/node"))
+            .await
+            .unwrap();
+        assert_eq!(only_stale.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let (mut fresh, _) = connect_async(format!("ws://{address}/proxy/ws"))
+            .await
+            .unwrap();
+        register(&mut fresh, "demo", "fresh", 1).await;
+        state.wait_for_worker_after("demo", "fresh", 0).await;
+        let get = tokio::spawn(reqwest::get(format!(
+            "http://{address}/proxy/request/demo/node"
+        )));
+        let request = receive_json(&mut fresh).await;
+        fresh
+            .send(Message::Text(
+                json!({"type":"response","uid":request["uid"],"status":200,"body":"fresh"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let response = get.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "fresh");
+        assert_eq!(state.metrics().scrapes(ScrapeOutcome::NoIdleWorker), 1);
+        drop(quiet);
+        shutdown.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scrape_timeout_header_bounds_the_ready_wait() {
+        let state = AppState::for_tests_with(Limits {
+            ready_timeout: Duration::from_secs(30),
+            ..fast_limits()
+        });
+        let (address, shutdown, server) = test_server(state.clone()).await;
+        let (mut socket, _) = connect_async(format!("ws://{address}/proxy/ws"))
+            .await
+            .unwrap();
+        register(&mut socket, "demo", "mute", 3).await;
+        state.wait_for_worker_after("demo", "mute", 0).await;
+
+        let started = std::time::Instant::now();
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/proxy/request/demo/node"))
+            .header("X-Prometheus-Scrape-Timeout-Seconds", "1")
+            .send()
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(state.metrics().scrapes(ScrapeOutcome::ReadyTimeout), 1);
+        assert_eq!(state.debug_counts().await, (1, 0));
+        drop(socket);
+        shutdown.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scrape_is_retried_on_another_worker_when_the_selected_one_disconnects() {
+        let state = AppState::for_tests_with(fast_limits());
+        let (address, shutdown, server) = test_server(state.clone()).await;
+        let (mut lost, _) = connect_async(format!("ws://{address}/proxy/ws"))
+            .await
+            .unwrap();
+        register(&mut lost, "demo", "lost", 3).await;
+        state.wait_for_worker_after("demo", "lost", 0).await;
+        let (mut survivor, _) = connect_async(format!("ws://{address}/proxy/ws"))
+            .await
+            .unwrap();
+        register(&mut survivor, "demo", "survivor", 3).await;
+        state.wait_for_worker_after("demo", "survivor", 0).await;
+
+        let get = tokio::spawn(reqwest::get(format!(
+            "http://{address}/proxy/request/demo/node"
+        )));
+        let first_ready = receive_json(&mut lost).await;
+        lost.send(Message::Text(
+            json!({"type":"ready","uid":first_ready["uid"],"worker":"lost"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let request = receive_json(&mut lost).await;
+        assert_eq!(request["type"], "request");
+        lost.close(None).await.unwrap();
+
+        let retry_ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let message = receive_json(&mut survivor).await;
+                if message["type"] == "ready" && message["uid"] != first_ready["uid"] {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("scrape was not retried on the surviving worker");
+        survivor
+            .send(Message::Text(
+                json!({"type":"ready","uid":retry_ready["uid"],"worker":"survivor"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let request = receive_json(&mut survivor).await;
+        survivor
+            .send(Message::Text(
+                json!({"type":"response","uid":request["uid"],"status":200,"body":"retried"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        let response = get.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "retried");
+        assert_eq!(state.metrics().retries(), 1);
+        assert_eq!(state.debug_counts().await, (1, 0));
+        shutdown.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scrape_waits_for_a_reconnecting_worker_after_losing_the_only_one() {
+        let state = AppState::for_tests_with(fast_limits());
+        let (address, shutdown, server) = test_server(state.clone()).await;
+        let (mut first, _) = connect_async(format!("ws://{address}/proxy/ws"))
+            .await
+            .unwrap();
+        register(&mut first, "demo", "unknown", 1).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.debug_counts().await.0 == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let get = tokio::spawn(reqwest::get(format!(
+            "http://{address}/proxy/request/demo/node"
+        )));
+        let _request = receive_json(&mut first).await;
+        first.close(None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (mut second, _) = connect_async(format!("ws://{address}/proxy/ws"))
+            .await
+            .unwrap();
+        register(&mut second, "demo", "unknown", 1).await;
+        let request = receive_json(&mut second).await;
+        second
+            .send(Message::Text(
+                json!({"type":"response","uid":request["uid"],"status":200,"body":"again"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let response = get.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "again");
+        assert_eq!(state.metrics().retries(), 1);
+        shutdown.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metrics_route_reports_workers_and_scrape_outcomes() {
+        let state = AppState::for_tests_with(fast_limits());
+        let (address, shutdown, server) = test_server(state.clone()).await;
+        let (mut socket, _) = connect_async(format!("ws://{address}/proxy/ws"))
+            .await
+            .unwrap();
+        register(&mut socket, "demo", "worker", 3).await;
+        state.wait_for_worker_after("demo", "worker", 0).await;
+        let missing = reqwest::get(format!("http://{address}/proxy/request/missing/node"))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let metrics = reqwest::get(format!("http://{address}/metrics"))
+            .await
+            .unwrap();
+        assert_eq!(metrics.status(), StatusCode::OK);
+        let text = metrics.text().await.unwrap();
+        for line in [
+            "proxy_workers{version=\"3\"} 1",
+            "proxy_worker_registrations_total{version=\"3\"} 1",
+            "proxy_websocket_connections 1",
+            "proxy_scrapes_total{result=\"unknown_instance\"} 1",
+        ] {
+            assert!(
+                text.lines().any(|candidate| candidate == line),
+                "{line}\n{text}"
+            );
+        }
+        drop(socket);
+        shutdown.cancel();
+        server.await.unwrap();
     }
 }
